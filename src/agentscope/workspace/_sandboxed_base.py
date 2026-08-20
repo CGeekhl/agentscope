@@ -94,6 +94,10 @@ class SandboxedWorkspaceBase(WorkspaceBase):
     is_alive: bool
     """Inherited lifecycle flag, repeated for file-scoped type checks."""
 
+    _mcps: list[MCPClient]
+    """Host-process MCP registry for direct-attach mode
+    (``MCP_HTTP_DIRECT=1``), repeated for file-scoped type checks."""
+
     _bootstrap_cmd_timeout: float = 1800.0
     """Per-command timeout applied to every :meth:`_setup_mcp_gateway`
     bootstrap step. Subclasses lower this for lighter base images
@@ -170,6 +174,12 @@ class SandboxedWorkspaceBase(WorkspaceBase):
             max_live_stateful_mcps=max_live_stateful_mcps,
         )
         self._gateway = None
+        # Host-process registry for HTTP MCPs in direct-attach mode
+        # (``MCP_HTTP_DIRECT=1``): business HTTP MCPs hang here instead
+        # of the in-sandbox gateway, so tool calls skip the sandbox hop.
+        # v2.0.6 upstream removed this attribute from WorkspaceBase while
+        # refactoring MCP management; re-added as fork state.
+        self._mcps: list[MCPClient] = []
 
     # ── subclass hooks ────────────────────────────────────────────
 
@@ -314,6 +324,10 @@ class SandboxedWorkspaceBase(WorkspaceBase):
         backend = self.get_backend()
         async with self._mcp_lock, self._skill_lock:
             await self._close_all_mcp_instances()
+            # Direct-attach HTTP MCPs on the host process.
+            for m in list(self._mcps):
+                await self._close_mcp_instance(m)
+            self._mcps = []
             self._mcp_specs.clear()
             self._equipped_partitions.clear()
 
@@ -351,6 +365,10 @@ class SandboxedWorkspaceBase(WorkspaceBase):
         ids, so the gateway keeps one upstream session per agent,
         session and MCP name.
 
+        Direct-attach mode (``MCP_HTTP_DIRECT=1``): business HTTP MCPs
+        hang on the host-process ``_mcps`` registry and are returned
+        ahead of gateway handles, deduped by name.
+
         Args:
             agent_id (`str | None`, optional):
                 The owning agent. ``None`` means the legacy ``""``.
@@ -358,9 +376,16 @@ class SandboxedWorkspaceBase(WorkspaceBase):
                 The owning session. ``None`` means the legacy ``""``.
         """
         if self._gateway is None:
+            # Direct-attached HTTP MCPs (host process) do not need the
+            # in-sandbox gateway.
+            if MCP_HTTP_DIRECT_ENABLED:
+                async with self._mcp_lock:
+                    return list(self._mcps)
             return []
         agent_id, session_id = agent_id or "", session_id or ""
         async with self._mcp_lock:
+            # Host-attached HTTP MCPs, in registration order.
+            direct = list(self._mcps) if MCP_HTTP_DIRECT_ENABLED else []
             self._mcp_last_used[(agent_id, session_id)] = time.monotonic()
             live = self._mcp_instances.setdefault((agent_id, session_id), {})
             specs = self._declared_specs(agent_id, session_id)
@@ -387,7 +412,19 @@ class SandboxedWorkspaceBase(WorkspaceBase):
                     )
             # Declaration order: an MCP rebuilt after eviction must
             # not jump to the end.
-            return [live[s.name] for s in specs if s.name in live]
+            gw_result = [live[s.name] for s in specs if s.name in live]
+            if not direct:
+                return gw_result
+            # Merge host-attached MCPs ahead of gateway handles, so a
+            # direct MCP never masks its gateway twin.
+            seen: set[str] = set()
+            merged: list[MCPClient] = []
+            for m in [*direct, *gw_result]:
+                if m.name in seen:
+                    continue
+                seen.add(m.name)
+                merged.append(m)
+            return merged
 
     async def add_mcp(
         self,
@@ -472,6 +509,15 @@ class SandboxedWorkspaceBase(WorkspaceBase):
             `RuntimeError`:
                 If the gateway is not attached.
         """
+        # Direct-attach mode: business HTTP MCPs live on the host
+        # process and are removed without any gateway round-trip.
+        if MCP_HTTP_DIRECT_ENABLED:
+            async with self._mcp_lock:
+                for i, m in enumerate(self._mcps):
+                    if m.name == name:
+                        del self._mcps[i]
+                        await self._close_mcp_instance(m)
+                        return
         if self._gateway is None:
             raise RuntimeError("Workspace has no MCP gateway attached.")
         agent_id, session_id = agent_id or "", session_id or ""
