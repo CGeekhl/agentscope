@@ -12,8 +12,11 @@ that wants them subscribes through the
 ``GET /sessions/{sid}/stream`` SSE endpoint.
 """
 import asyncio
+import hashlib
 import inspect
 import json
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal, TYPE_CHECKING
 
@@ -158,6 +161,7 @@ class ChatService:
         custom_agent_cls: type[Agent] | None = None,
         extra_projectors: list[EventProjector] | None = None,
         channel_clients: "ChannelClients | None" = None,
+        build_cache_max_size: int = 512,
     ) -> None:
         """Initialize chat service.
 
@@ -256,6 +260,33 @@ class ChatService:
             SubagentHitlProjector(storage),
             *(extra_projectors or []),
         ]
+        # P1: per-session build cache — keyed by (user, agent, session),
+        # LRU-evicted. Each entry reuses the assembled toolkit / model /
+        # agent across consecutive turns; only the mutable AgentState is
+        # hot-swapped per turn (see ``_build_fingerprint``).
+        self._build_cache: "OrderedDict[tuple[str, str, str], dict[str, object]]" = (
+            OrderedDict()
+        )
+        self._build_cache_max_size = max(build_cache_max_size, 1)
+
+    def _build_fingerprint(
+        self,
+        agent_record: AgentRecord,
+        session_record: SessionRecord,
+    ) -> str:
+        """Hash the build inputs that change what gets assembled.
+
+        The mutable ``AgentState`` (persisted after every turn) is
+        deliberately excluded — it is hot-swapped onto the cached agent
+        instead of participating in the fingerprint, so that consecutive
+        turns of a session reuse the build while state keeps evolving.
+        """
+        payload = {
+            "agent": agent_record.data.model_dump(mode="json"),
+            "config": session_record.config.model_dump(mode="json"),
+        }
+        raw = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     async def run(
         self,
@@ -873,12 +904,32 @@ class ChatService:
                             leader_name=leader.name,
                         )
 
-                workspace = await self._workspace_manager.get_workspace(
-                    user_id,
-                    agent_id,
-                    session_id,
-                    session_record.config.workspace_id,
+                # P1: per-session build cache — keyed by (user, agent, session),
+                # LRU-evicted. A HIT reuses the assembled workspace (and the
+                # cached agent, hot-swapped with this run's fresh state); a MISS
+                # assembles from scratch below. Only the mutable AgentState is
+                # hot-swapped per turn, never carried stale.
+                agent = None
+                build_started = time.perf_counter()
+                cache_key = (user_id, agent_id, session_id)
+                fingerprint = self._build_fingerprint(agent_record, session_record)
+                cached = self._build_cache.get(cache_key)
+                build_hit = (
+                    cached is not None and cached["fingerprint"] == fingerprint
                 )
+                if build_hit:
+                    workspace = cached["workspace"]
+                    agent = cached["agent"]
+                    session_record.state.session_id = session_id
+                    agent.state = session_record.state
+                    self._build_cache.move_to_end(cache_key)
+                if agent is None:
+                    workspace = await self._workspace_manager.get_workspace(
+                        user_id,
+                        agent_id,
+                        session_id,
+                        session_record.config.workspace_id,
+                    )
 
                 # Add workspace working directory to the permission context
                 working_dirs = (
@@ -1019,106 +1070,120 @@ class ChatService:
                 # 3. Toolkit (workspace tools + planning + ToolStop +
                 # schedule + team + extras + skills + mcps).
                 # -------------------------------------------------------------
-                toolkit = await get_toolkit(
-                    storage=self._storage,
-                    workspace=workspace,
-                    workspace_manager=self._workspace_manager,
-                    scheduler_manager=self._scheduler_manager,
-                    background_task_manager=self._background_task_manager,
-                    message_bus=self._message_bus,
-                    middlewares=middlewares,
-                    user_id=user_id,
-                    agent_record=agent_record,
-                    session_record=session_record,
-                    resource_access_service=self._access,
-                    extra_factory=self._extra_agent_tools,
-                    sub_agent_templates=self._sub_agent_templates,
-                    team_role=team_ctx.role if team_ctx else None,
-                    channel_tools=channel_tools,
-                )
-
-                # -------------------------------------------------------------
-                # 4. Model + fallback (resolved from session's config).
-                # -------------------------------------------------------------
-                model_cfg = session_record.config.chat_model_config
-                if not model_cfg:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=(
-                            f"No model configuration found for agent "
-                            f"{agent_id}"
-                        ),
+                if agent is None:
+                    toolkit = await get_toolkit(
+                        storage=self._storage,
+                        workspace=workspace,
+                        workspace_manager=self._workspace_manager,
+                        scheduler_manager=self._scheduler_manager,
+                        background_task_manager=self._background_task_manager,
+                        message_bus=self._message_bus,
+                        middlewares=middlewares,
+                        user_id=user_id,
+                        agent_record=agent_record,
+                        session_record=session_record,
+                        resource_access_service=self._access,
+                        extra_factory=self._extra_agent_tools,
+                        sub_agent_templates=self._sub_agent_templates,
+                        team_role=team_ctx.role if team_ctx else None,
+                        channel_tools=channel_tools,
                     )
-                model = await get_model(user_id, model_cfg, self._access)
 
-                fallback_cfg = session_record.config.fallback_chat_model_config
-                fallback_model = (
-                    await get_model(user_id, fallback_cfg, self._access)
-                    if fallback_cfg is not None
-                    else None
-                )
+                    # -------------------------------------------------------------
+                    # 4. Model + fallback (resolved from session's config).
+                    # -------------------------------------------------------------
+                    model_cfg = session_record.config.chat_model_config
+                    if not model_cfg:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=(
+                                f"No model configuration found for agent "
+                                f"{agent_id}"
+                            ),
+                        )
+                    model = await get_model(user_id, model_cfg, self._access)
 
-                # -------------------------------------------------------------
-                # 5. Assemble the Agent.
-                # -------------------------------------------------------------
-                attachment = f"You're within a session (id={session_id})."
-
-                # Channel-bound sessions: tell the agent which chat it serves.
-                if channel is not None:
-                    tools = ", ".join(t.name for t in channel_tools)
-                    chat_id = session_record.origin.chat_id
-                    kind = await channel.chat_kind(chat_id)
-                    name = (
-                        session_record.origin.chat_name
-                        or await channel.chat_name(chat_id)
+                    fallback_cfg = (
+                        session_record.config.fallback_chat_model_config
                     )
-                    where = f' named "{name}"' if name else ""
-                    attachment += (
-                        f" This session is bound to a chat{where} (id "
-                        f"{chat_id!r}) on the {channel.display_name} "
-                        f"platform: the messages, images and files people "
-                        f"send there are relayed to you here, and your "
-                        f"replies are delivered back to that same chat."
+                    fallback_model = (
+                        await get_model(user_id, fallback_cfg, self._access)
+                        if fallback_cfg is not None
+                        else None
                     )
-                    if kind is ChatKind.GROUP:
-                        attachment += (
-                            " It is a group chat, so messages may come "
-                            "from several different people; each incoming "
-                            "user turn is labelled with its sender."
-                        )
-                    elif kind is ChatKind.PRIVATE:
-                        attachment += (
-                            " It is a one-to-one private chat with a "
-                            "single user."
-                        )
-                    if tools:
-                        attachment += (
-                            f" You also have these {channel.display_name} "
-                            f"tools available: {tools}. Pass this chat's id "
-                            f"as their target to act on this chat."
-                        )
 
-                attachment = (
-                    f"<system-notification>{attachment}</system-notification>"
-                )
-                system_prompt = (
-                    agent_record.data.system_prompt + "\n\n" + attachment
-                )
+                    # -------------------------------------------------------------
+                    # 5. Assemble the Agent.
+                    # -------------------------------------------------------------
+                    attachment = f"You're within a session (id={session_id})."
 
-                agent_state = session_record.state
-                agent_state.session_id = session_id
-                agent = self._agent_cls(
-                    name=agent_record.data.name,
-                    system_prompt=system_prompt,
-                    model=model,
-                    toolkit=toolkit,
-                    model_config=ModelConfig(fallback_model=fallback_model),
-                    context_config=agent_record.data.context_config,
-                    react_config=agent_record.data.react_config,
-                    state=agent_state,
-                    middlewares=middlewares,
-                    offloader=workspace,
-                )
+                    # Channel-bound sessions: tell the agent which chat it serves.
+                    if channel is not None:
+                        tools = ", ".join(t.name for t in channel_tools)
+                        chat_id = session_record.origin.chat_id
+                        kind = await channel.chat_kind(chat_id)
+                        name = (
+                            session_record.origin.chat_name
+                            or await channel.chat_name(chat_id)
+                        )
+                        where = f' named "{name}"' if name else ""
+                        attachment += (
+                            f" This session is bound to a chat{where} (id "
+                            f"{chat_id!r}) on the {channel.display_name} "
+                            f"platform: the messages, images and files people "
+                            f"send there are relayed to you here, and your "
+                            f"replies are delivered back to that same chat."
+                        )
+                        if kind is ChatKind.GROUP:
+                            attachment += (
+                                " It is a group chat, so messages may come "
+                                "from several different people; each incoming "
+                                "user turn is labelled with its sender."
+                            )
+                        elif kind is ChatKind.PRIVATE:
+                            attachment += (
+                                " It is a one-to-one private chat with a "
+                                "single user."
+                            )
+                        if tools:
+                            attachment += (
+                                f" You also have these {channel.display_name} "
+                                f"tools available: {tools}. Pass this chat's id "
+                                f"as their target to act on this chat."
+                            )
+
+                    attachment = (
+                        f"<system-notification>{attachment}</system-notification>"
+                    )
+                    system_prompt = (
+                        agent_record.data.system_prompt + "\n\n" + attachment
+                    )
+
+                    agent_state = session_record.state
+                    agent_state.session_id = session_id
+                    agent = self._agent_cls(
+                        name=agent_record.data.name,
+                        system_prompt=system_prompt,
+                        model=model,
+                        toolkit=toolkit,
+                        model_config=ModelConfig(fallback_model=fallback_model),
+                        context_config=agent_record.data.context_config,
+                        react_config=agent_record.data.react_config,
+                        state=agent_state,
+                        middlewares=middlewares,
+                        offloader=workspace,
+                    )
+
+                    # P1: store the assembled build for reuse by the next turn
+                    # of this session. LRU-evicted when the cache exceeds its
+                    # capacity.
+                    if len(self._build_cache) >= self._build_cache_max_size:
+                        self._build_cache.popitem(last=False)
+                    self._build_cache[cache_key] = {
+                        "fingerprint": fingerprint,
+                        "agent": agent,
+                        "workspace": workspace,
+                    }
 
                 if self._skip_parked_wakeup(session_id, agent, input_msg):
                     return
