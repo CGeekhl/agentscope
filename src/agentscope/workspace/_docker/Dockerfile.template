@@ -18,11 +18,14 @@
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates ripgrep \
  && rm -rf /var/lib/apt/lists/* \
- && curl -LsSf https://astral.sh/uv/install.sh \
-        | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+ && if ! command -v uv >/dev/null 2>&1; then \
+        python3 -m pip install --break-system-packages -q \
+          -i https://mirrors.aliyun.com/pypi/simple/ uv; \
+    fi
 
 {node_copy_block}ENV UV_PROJECT_ENVIRONMENT={gateway_home}/.venv \
     UV_LINK_MODE=copy \
+    UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     PATH={gateway_home}/.venv/bin:$PATH
 WORKDIR {gateway_home}
 RUN uv venv {gateway_home}/.venv

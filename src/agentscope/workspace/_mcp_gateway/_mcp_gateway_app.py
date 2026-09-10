@@ -14,9 +14,7 @@ Endpoints::
     GET    /health
     GET    /mcps                       # [MCPClient.model_dump(), ...]
     POST   /mcps                       # body: MCPClient.model_dump()
-                                       #   (+ optional runtime_headers)
     DELETE /mcps/{name}
-    PUT    /mcps/{name}/runtime-headers
     GET    /mcps/{name}/tools
     POST   /mcps/{name}/tools/{tool}   # body: {arguments: {...}}
 
@@ -35,7 +33,7 @@ import asyncio
 import secrets
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from agentscope.mcp import MCPClient
@@ -49,20 +47,11 @@ class _State:
         self.lock = asyncio.Lock()
 
 
-async def _build_client(
-    spec: dict[str, Any],
-    runtime_headers: dict[str, str] | None = None,
-) -> MCPClient:
+async def _build_client(spec: dict[str, Any]) -> MCPClient:
     """Validate a spec into an ``MCPClient``, connect if stateful,
     and prime its tool cache.
-
-    ``runtime_headers`` are applied before connecting: a rotated
-    credential has to be in place for the handshake below, and it is
-    not part of ``spec`` because it must never be persisted.
     """
     client = MCPClient.model_validate(spec)
-    if runtime_headers:
-        await client.set_runtime_headers(runtime_headers)
     if client.is_stateful:
         await client.connect()
     await client.list_raw_tools()
@@ -131,7 +120,6 @@ def _build_app(
         session_id: str = "",
     ) -> dict[str, Any]:
         body = await request.json()
-        runtime_headers = body.pop("runtime_headers", None)
         name = body.get("name", "")
         if not name:
             raise HTTPException(400, "name required")
@@ -144,11 +132,9 @@ def _build_app(
                     f"session={session_id!r}",
                 )
             try:
-                by_name[name] = await _build_client(body, runtime_headers)
+                by_name[name] = await _build_client(body)
             except HTTPException:
                 raise
-            except ValueError as e:
-                raise HTTPException(400, str(e)) from e
             except Exception as e:  # noqa: BLE001
                 raise HTTPException(500, f"connect failed: {e}") from e
         return {"ok": True}
@@ -167,29 +153,6 @@ def _build_app(
             if client.is_stateful and client.is_connected:
                 await client.close()
         return {"ok": True}
-
-    @app.put("/mcps/{name}/runtime-headers", status_code=204)
-    async def _set_runtime_headers(
-        name: str,
-        request: Request,
-        agent_id: str = "",
-        session_id: str = "",
-    ) -> Response:
-        """Replace live headers without rebuilding the MCP client."""
-        body = await request.json()
-        headers = body.get("headers") if isinstance(body, dict) else None
-        if not isinstance(headers, dict):
-            raise HTTPException(
-                400,
-                "headers must be a JSON object",
-            )
-        try:
-            async with state.lock:
-                client = _lookup(agent_id, session_id, name)
-                await client.set_runtime_headers(headers)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
-        return Response(status_code=204)
 
     @app.get("/mcps/{name}/tools")
     async def _list_tools(
@@ -226,6 +189,7 @@ def _build_app(
 
 async def _run(
     port: int,
+    host: str,
     auth_token: str | None = None,
     instance_nonce: str | None = None,
 ) -> None:
@@ -242,7 +206,7 @@ async def _run(
 
     uvi_cfg = uvicorn.Config(
         app,
-        host="127.0.0.1",
+        host=host,
         port=port,
         log_level="info",
     )
@@ -264,6 +228,17 @@ def main() -> None:
     # Accepted and ignored — kept so an image shipping an older
     # launch command still starts.
     parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Address to bind. Keep the default loopback binding when the "
+            "host talks to the gateway through an in-sandbox shim; pass "
+            "0.0.0.0 when the host needs to reach the gateway through the "
+            "sandbox provider's server-side proxy (see "
+            "AGENTSCOPE_GATEWAY_PROXY_DIRECT)."
+        ),
+    )
     parser.add_argument("--port", type=int, default=5600)
     parser.add_argument("--auth-token")
     parser.add_argument("--instance-nonce")
@@ -271,6 +246,7 @@ def main() -> None:
     asyncio.run(
         _run(
             args.port,
+            args.host,
             auth_token=args.auth_token,
             instance_nonce=args.instance_nonce,
         ),
